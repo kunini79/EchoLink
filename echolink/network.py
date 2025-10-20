@@ -1,99 +1,86 @@
-
 import socket
 import threading
 import time
+from . import config
+from . import state
+from . import ui
 
-# --- Configuration ---
-BROADCAST_PORT = 50000
-TCP_PORT = 50001
-BROADCAST_MESSAGE_PREFIX = "ECHOLINK_DISCOVERY"
-BUFFER_SIZE = 1024
-DISCOVERY_INTERVAL = 5
-
-class NetworkManager:
-    def __init__(self, username, message_callback, user_update_callback):
-        self.username = username
-        self.message_callback = message_callback
-        self.user_update_callback = user_update_callback
-        self.online_users = {}
-        self.local_ip = self._get_local_ip()
-        self.running = True
-
-        self.broadcast_thread = threading.Thread(target=self._broadcast_discovery, daemon=True)
-        self.discovery_listen_thread = threading.Thread(target=self._listen_for_discovery, daemon=True)
-        self.tcp_listen_thread = threading.Thread(target=self._listen_for_tcp, daemon=True)
-
-    def start(self):
-        self.broadcast_thread.start()
-        self.discovery_listen_thread.start()
-        self.tcp_listen_thread.start()
-
-    def stop(self):
-        self.running = False
-
-    def _get_local_ip(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(('10.255.255.255', 1))
-            IP = s.getsockname()[0]
-        except Exception:
-            IP = '127.0.0.1'
-        finally:
-            s.close()
-        return IP
-
-    def _broadcast_discovery(self):
+def broadcast_discovery():
+    try:
         broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         
-        while self.running:
-            message = f"{BROADCAST_MESSAGE_PREFIX}:{self.username}"
-            broadcast_socket.sendto(message.encode('utf-8'), ('<broadcast>', BROADCAST_PORT))
-            time.sleep(DISCOVERY_INTERVAL)
+        while True:
+            message = f"{config.BROADCAST_MESSAGE_PREFIX}:{state.USERNAME}"
+            broadcast_socket.sendto(message.encode('utf-8'), ('<broadcast>', config.BROADCAST_PORT))
+            time.sleep(config.DISCOVERY_INTERVAL)
+    except (socket.error, OSError) as e:
+        print(f"\n[ERROR] Broadcast discovery failed: {e}")
+        ui.print_prompt()
 
-    def _listen_for_discovery(self):
+
+def listen_for_discovery():
+    try:
         listen_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listen_socket.bind(("", BROADCAST_PORT))
+        listen_socket.bind(("", config.BROADCAST_PORT))
         
-        while self.running:
-            data, addr = listen_socket.recvfrom(BUFFER_SIZE)
+        while True:
+            data, addr = listen_socket.recvfrom(config.BUFFER_SIZE)
             message = data.decode('utf-8')
             
-            if addr[0] == self.local_ip:
+            if addr[0] == state.LOCAL_IP:
                 continue
 
-            if message.startswith(BROADCAST_MESSAGE_PREFIX):
+            if message.startswith(config.BROADCAST_MESSAGE_PREFIX):
                 ip = addr[0]
-                username = message.split(":", 1)[1]
-                if ip not in self.online_users:
-                    self.online_users[ip] = username
-                    self.user_update_callback(self.online_users)
+                username = message.split(":")[1]
+                if ip not in state.online_users:
+                    print(f"\n[{time.strftime('%H:%M:%S')}] Discovered user: {username} ({ip})")
+                    ui.print_prompt()
+                state.online_users[ip] = (username, time.time())
+    except (socket.error, OSError) as e:
+        print(f"\n[ERROR] Discovery listener failed: {e}")
+        ui.print_prompt()
 
-    def _listen_for_tcp(self):
-        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_socket.bind(("", TCP_PORT))
-        tcp_socket.listen(5)
+
+def listen_for_messages():
+    try:
+        unicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        unicast_socket.bind(("", config.UNICAST_PORT))
         
-        while self.running:
-            conn, addr = tcp_socket.accept()
-            with conn:
-                data = conn.recv(BUFFER_SIZE)
-                if data:
-                    sender_ip = addr[0]
-                    sender_username = self.online_users.get(sender_ip, "Unknown")
-                    message = data.decode('utf-8')
-                    self.message_callback(sender_username, message)
+        while True:
+            data, addr = unicast_socket.recvfrom(config.BUFFER_SIZE)
+            sender_ip = addr[0]
+            sender_username = state.online_users.get(sender_ip, ("Unknown", None))[0]
+            message = data.decode('utf-8')
+            print(f"\n[{time.strftime('%H:%M:%S')}] Message from {sender_username}: {message}")
+            ui.print_prompt()
+    except (socket.error, OSError) as e:
+        print(f"\n[ERROR] Message listener failed: {e}")
+        ui.print_prompt()
 
-    def send_message(self, target_ip, message):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((target_ip, TCP_PORT))
-                s.sendall(message.encode('utf-8'))
-        except ConnectionRefusedError:
-            # User might have gone offline
-            if target_ip in self.online_users:
-                del self.online_users[target_ip]
-                self.user_update_callback(self.online_users)
-            return False
-        return True
+
+def send_message(target_ip, message):
+    try:
+        send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        send_socket.sendto(message.encode('utf-8'), (target_ip, config.UNICAST_PORT))
+        send_socket.close()
+    except (socket.error, OSError) as e:
+        print(f"\n[ERROR] Failed to send message to {target_ip}: {e}")
+        ui.print_prompt()
+
+def check_stale_users():
+    while True:
+        stale_users = []
+        for ip, (username, last_seen) in state.online_users.items():
+            if time.time() - last_seen > config.DISCOVERY_INTERVAL * 2:
+                stale_users.append(ip)
+
+        for ip in stale_users:
+            username = state.online_users[ip][0]
+            del state.online_users[ip]
+            print(f"\n[{time.strftime('%H:%M:%S')}] User has gone offline: {username} ({ip})")
+            ui.print_prompt()
+
+        time.sleep(config.DISCOVERY_INTERVAL)
