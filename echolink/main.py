@@ -1,36 +1,38 @@
-
-import tkinter as tk
-from tkinter import simpledialog
-from echolink.gui import ChatGUI
-from echolink.network import NetworkManager
+import threading
 import time
+import sys
+from . import state
+from . import network
+from . import ui
+from . import gui
 
 def main():
-    # We need a root window to show the dialog, but we don't want it to be the main app window
-    root = tk.Tk()
-    root.withdraw() # Hide the root window
+    state.USERNAME = input("Enter your username: ").strip()
+    if not state.USERNAME:
+        state.USERNAME = f"User_{int(time.time()) % 1000}"
 
-    username = simpledialog.askstring("Username", "Please enter your username:", parent=root)
-    if not username:
-        username = f"User_{int(time.time()) % 1000}"
-    
-    root.destroy() # We don't need this root window anymore
+    print(f"--- Welcome to EchoLink, {state.USERNAME}! ---")
+    print(f"Your IP is: {state.LOCAL_IP}")
 
-    # --- Callbacks ---
-    def on_message_received(sender, message):
-        app.receive_message(sender, message)
+    # Start background threads
+    broadcast_thread = threading.Thread(target=network.broadcast_discovery, daemon=True)
+    discovery_listen_thread = threading.Thread(target=network.listen_for_discovery, daemon=True)
+    message_listen_thread = threading.Thread(target=network.listen_for_messages, daemon=True)
+    stale_user_thread = threading.Thread(target=network.check_stale_users, daemon=True)
 
-    def on_user_update(users):
-        app.update_user_list(users)
+    broadcast_thread.start()
+    discovery_listen_thread.start()
+    message_listen_thread.start()
+    stale_user_thread.start()
 
-    # --- Initialization ---
-    network = NetworkManager(username, on_message_received, on_user_update)
-    app = ChatGUI(network)
-
-    # --- Start Application ---
-    network.start()
-    app.run() # This blocks until the GUI is closed
-    network.stop()
+    if '--cli' in sys.argv:
+        print("Type 'users' to see online users.")
+        print("Type 'send <username> <message>' to send a message.")
+        print("Type 'exit' to leave.")
+        ui.main_ui()
+        print("Exiting EchoLink. Goodbye.")
+    else:
+        gui.EchoLinkGUI().run()
 
 if __name__ == "__main__":
     main()

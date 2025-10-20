@@ -1,77 +1,117 @@
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.textinput import TextInput
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.recycleview import RecycleView
+from kivy.uix.spinner import Spinner
+from kivy.clock import Clock
+from . import state
+from . import network
+import queue
 
+# A queue to pass messages from the network threads to the GUI
+message_queue = queue.Queue()
 
-import tkinter as tk
-from tkinter import scrolledtext, simpledialog, messagebox
-import threading
+class UserList(RecycleView):
+    def __init__(self, **kwargs):
+        super(UserList, self).__init__(**kwargs)
+        self.data = []
 
-class ChatGUI(tk.Tk):
-    def __init__(self, network_manager):
-        super().__init__()
-        self.network_manager = network_manager
-        self.title(f"EchoLink - {network_manager.username}")
-        self.geometry("400x500")
+    def update_users(self, dt):
+        self.data = [{'text': f"{username} ({ip})"} for ip, (username, last_seen) in state.online_users.items()]
 
-        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+class ChatLayout(BoxLayout):
+    def __init__(self, **kwargs):
+        super(ChatLayout, self).__init__(**kwargs)
+        self.orientation = 'vertical'
 
-        # --- Widgets ---
-        self.user_list = tk.Listbox(self, width=15)
-        self.chat_area = scrolledtext.ScrolledText(self, wrap=tk.WORD, state='disabled')
-        self.message_entry = tk.Entry(self, width=40)
-        self.send_button = tk.Button(self, text="Send", command=self._send_message)
+        self.history = Label(text='Welcome to EchoLink!\n', size_hint_y=0.7)
+        self.add_widget(self.history)
 
-        # --- Layout ---
-        self.user_list.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
-        self.chat_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
-        self.send_button.pack(side=tk.RIGHT, padx=5, pady=5)
+        self.user_list = UserList(size_hint_y=0.2)
+        self.add_widget(self.user_list)
+        Clock.schedule_interval(self.user_list.update_users, 1.0) # Update user list every second
 
-        self.message_entry.bind("<Return>", self._send_message)
+        input_layout = BoxLayout(size_hint_y=0.1, orientation='horizontal')
+        self.add_widget(input_layout)
 
-    def _on_closing(self):
-        if messagebox.askokcancel("Quit", "Do you want to quit?"):
-            self.network_manager.stop()
-            self.destroy()
+        self.user_selector = Spinner(text='Select User')
+        input_layout.add_widget(self.user_selector)
+        Clock.schedule_interval(self.update_user_selector, 1.0)
 
-    def _send_message(self, event=None):
-        message = self.message_entry.get()
-        if not message:
-            return
+        self.new_message = TextInput(multiline=False, readonly=False)
+        input_layout.add_widget(self.new_message)
 
-        selected_user_index = self.user_list.curselection()
-        if not selected_user_index:
-            messagebox.showwarning("No User Selected", "Please select a user from the list to send a message.")
-            return
+        self.send_button = Button(text='Send')
+        self.send_button.bind(on_press=self.send_message)
+        input_layout.add_widget(self.send_button)
 
-        target_username = self.user_list.get(selected_user_index)
-        target_ip = None
-        for ip, username in self.network_manager.online_users.items():
-            if username == target_username:
-                target_ip = ip
-                break
+        Clock.schedule_interval(self.check_queue, 0.1)
 
-        if target_ip:
-            if self.network_manager.send_message(target_ip, message):
-                self._display_message(f"You: {message}")
-                self.message_entry.delete(0, tk.END)
-            else:
-                messagebox.showerror("Message Failed", f"Could not send message to {target_username}. They may have gone offline.")
-        else:
-            messagebox.showerror("User Not Found", f"User {target_username} could not be found.")
+    def update_user_selector(self, dt):
+        self.user_selector.values = [f"{username} ({ip})" for ip, (username, last_seen) in state.online_users.items()]
 
-    def _display_message(self, message):
-        self.chat_area.config(state='normal')
-        self.chat_area.insert(tk.END, message + "\n")
-        self.chat_area.config(state='disabled')
-        self.chat_area.yview(tk.END)
+    def send_message(self, instance):
+        message = self.new_message.text
+        target = self.user_selector.text
+        if message and target != 'Select User':
+            self.history.text += f'[ME]: {message}\n'
+            self.new_message.text = ''
 
-    def update_user_list(self, users):
-        self.user_list.delete(0, tk.END)
-        for ip, username in users.items():
-            self.user_list.insert(tk.END, username)
+            # Extract IP from "username (ip)"
+            target_ip = target.split('(')[1].split(')')[0]
+            network.send_message(target_ip, message)
 
-    def receive_message(self, username, message):
-        self._display_message(f"{username}: {message}")
+    def check_queue(self, dt):
+        while not message_queue.empty():
+            message = message_queue.get()
+            self.history.text += message + '\n'
 
-    def run(self):
-        self.mainloop()
+class EchoLinkGUI(App):
+    def build(self):
+        return ChatLayout()
 
+def gui_listen_for_messages():
+    try:
+        unicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        unicast_socket.bind(("", config.UNICAST_PORT))
+
+        while True:
+            data, addr = unicast_socket.recvfrom(config.BUFFER_SIZE)
+            sender_ip = addr[0]
+            sender_username = state.online_users.get(sender_ip, ("Unknown", None))[0]
+            message = data.decode('utf-8')
+            message_queue.put(f"[{sender_username}]: {message}")
+    except (socket.error, OSError) as e:
+        message_queue.put(f"[ERROR] Message listener failed: {e}")
+
+def gui_listen_for_discovery():
+    try:
+        listen_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen_socket.bind(("", config.BROADCAST_PORT))
+
+        while True:
+            data, addr = listen_socket.recvfrom(config.BUFFER_SIZE)
+            message = data.decode('utf-8')
+
+            if addr[0] == state.LOCAL_IP:
+                continue
+
+            if message.startswith(config.BROADCAST_MESSAGE_PREFIX):
+                ip = addr[0]
+                username = message.split(":")[1]
+                if ip not in state.online_users:
+                    message_queue.put(f"Discovered user: {username} ({ip})")
+                state.online_users[ip] = (username, time.time())
+    except (socket.error, OSError) as e:
+        message_queue.put(f"[ERROR] Discovery listener failed: {e}")
+
+# We need to replace the network listeners with versions that put messages in the queue
+import socket
+import time
+from . import config
+
+network.listen_for_messages = gui_listen_for_messages
+network.listen_for_discovery = gui_listen_for_discovery
